@@ -5,19 +5,16 @@
 //  Created by mayong on 2025/1/16.
 //
 
+import Combine
 import Foundation
 import WebKit
-import Combine
-#if canImport(UIDelegateProxy)
-import UIDelegateProxy
-#endif
 
 extension CharacterSet {
     static let dss_namesapceSet = CharacterSet(charactersIn: " .\n")
 }
 
 extension String {
-    var dss_argsObject: [String: Any]? {
+    var dss_jsonDictionary: [String: Any]? {
         get throws {
             guard let data = data(using: .utf8) else { return nil }
             return try JSONSerialization
@@ -44,47 +41,20 @@ extension String {
 open class DSS_WebView: WKWebView {
     open var dss_prefix = "_dsbridge="
     
-    open private(set) var dss_isPrepared: Bool = false
-    
     open private(set) var dss_namespaceHandlers: [String: DSS_NamespaceHandler] = [:]
     
-    @DSS_AutomicInt
-    public var dss_callbackId: Int = 0
-    
-    public let dss_delegateProxy: DSS_UIDelegateProxy = .dss_default()
-    
-    let dss_javaScriptEvent = PassthroughSubject<String, Never>()
-    
-    private var dss_javaScriptCancellable: AnyCancellable?
-    
-    override open func load(_ request: URLRequest) -> WKNavigation? {
-        if !dss_isPrepared {
-            dss_prepareConfiguration(configuration)
-            dss_isPrepared.toggle()
-        }
-        return super.load(request)
+    override public init(frame: CGRect, configuration: WKWebViewConfiguration) {
+        super.init(frame: frame, configuration: configuration)
+        dss_prepareConfiguration(configuration)
     }
     
-    @MainActor open func dss_addUIDelegate(_ dss_delegate: WKUIDelegate) {
-        dss_delegateProxy.dss_add(dss_delegate)
+    @available(*, unavailable)
+    public required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
     }
     
-    @MainActor open func dss_setNamespaceHandler(_ dss_handler: DSS_NamespaceHandler) {
-        dss_namespaceHandlers[dss_handler.dss_namespace] = dss_handler
-    }
-    
-    @discardableResult
-    open func dss_callHandler(
-        _ dss_handlerName: String,
-        dss_arguments: [String: Any]? = nil
-    ) async -> Any? {
-        
-    }
-
     open func dss_prepareConfiguration(_ configuration: WKWebViewConfiguration) {
-        dss_delegateProxy.dss_add(self)
-        
-        uiDelegate = dss_delegateProxy
+        uiDelegate = self
 
         let dss_script = WKUserScript(
             source: "window._dswk=true;",
@@ -95,13 +65,43 @@ open class DSS_WebView: WKWebView {
         configuration.userContentController.addUserScript(dss_script)
         
         dss_javaScriptCancellable = dss_javaScriptEvent
-            .delay(for: .seconds(0.5), scheduler: DispatchQueue.main)
+            .delay(for: .milliseconds(50), scheduler: DispatchQueue.main)
             .sink { [weak self] dss_script in
                 self?.evaluateJavaScript(dss_script)
             }
         
         // TODO: - Add your own configuration
-        
+    }
+    
+    @DSS_AutomicInt
+    public var dss_callbackId: Int = 0
+
+    private var dss_handlerMap: [String: DSS_HandlerMethod] = [:]
+
+    let dss_javaScriptEvent = PassthroughSubject<String, Never>()
+    
+    private var dss_javaScriptCancellable: AnyCancellable?
+
+    open func dss_setNamespaceHandler(_ dss_handler: DSS_NamespaceHandler) {
+        dss_namespaceHandlers[dss_handler.dss_namespace] = dss_handler
+    }
+    
+    @discardableResult
+    open func dss_callHandler(
+        _ dss_handlerName: String,
+        dss_arguments: [String: Any]? = nil
+    ) async -> Any? {
+        let dss_callInfo = [
+            "method": dss_handlerName,
+            "data": String.dss_jsonString(dss_arguments),
+            "callbackId": "\(dss_callbackId)"
+        ]
+
+//        let dss_task = Task {
+//            try? await evaluateJavaScript(
+//                String(format: "window._handleMessageFromNative(%@)", String.dss_jsonString(dss_callInfo))
+//            )
+//        }
     }
 }
 
@@ -117,29 +117,44 @@ extension DSS_WebView {
             .dss_methodForName(dss_method)
     }
     
-    func dss_invoke(_ dss_prompt: String, dss_arguments: String?) async -> String? {
-        guard let dss_method = dss_methodForPrompt(dss_prompt) else {
+    func dss_invoke(_ dss_originString: String, dss_arguments: String?) async -> String? {
+        guard let dss_method = dss_methodForPrompt(dss_originString) else {
+#if DEBUG
+            print("DSBridgeSwift: \(#function) no method for prompt: \(dss_originString)")
+#endif
             return "{\"code\":-1,\"data\":\"\"}"
         }
-        
-        let dss_args = try? dss_arguments?.dss_argsObject
-        let dss_result = await dss_method(dss_args)
-        
-        var dss_retValue: [String: Any] = ["code": 0]
-        if let dss_result {
-            dss_retValue["data"] = dss_result
+
+        do {
+            let dss_args = try dss_arguments?.dss_jsonDictionary
+
+            let dss_data = dss_args?["data"] as? [String: Any]
+
+            let dss_result = await dss_method(dss_data)
+
+            var dss_retValue: [String: Any] = ["code": 0]
+
+            if let dss_result {
+                dss_retValue["data"] = dss_result
+            }
+
+            if let dss_callback = dss_args?["_dscbstub"] as? String {
+                let dss_callbackJavaScript = String(
+                    format: "try {%@(JSON.parse(decodeURIComponent(\"%@\")).data);delete window.%@; } catch(e){};",
+                    dss_callback,
+                    String.dss_jsonString(dss_retValue),
+                    dss_callback
+                )
+                dss_javaScriptEvent.send(dss_callbackJavaScript)
+            }
+
+            return .dss_jsonString(dss_retValue)
+        } catch {
+#if DEBUG
+            print("DSBridgeSwift: \(#function) error: \(error)")
+#endif
+            return "{\"code\":-1,\"data\":\"\"}"
         }
-        
-        if let dss_callback = dss_args?["_dscbstub"]  as? String {
-            let dss_callbackJavaScript = String(
-                format: "try {%@(JSON.parse(decodeURIComponent(\"%@\")).data);delete window.%@; } catch(e){};",
-                dss_callback,
-                String.dss_jsonString(dss_result),
-                dss_callback
-            )
-            dss_javaScriptEvent.send(dss_callbackJavaScript)
-        }
-        return .dss_jsonString(dss_retValue)
     }
 }
 
@@ -150,13 +165,17 @@ extension DSS_WebView: WKUIDelegate {
         defaultText: String?,
         initiatedByFrame frame: WKFrameInfo
     ) async -> String? {
-        if prompt.hasPrefix(dss_prefix) {
-            return await dss_invoke(
-                prompt.dropFirst(dss_prefix.count).description,
-                dss_arguments: defaultText
-            )
+        guard prompt.hasPrefix(dss_prefix) else {
+            return nil
         }
-        return nil
+        let dss_prefixIndex = prompt.index(
+            prompt.startIndex,
+            offsetBy: dss_prefix.count
+        )
+        return await dss_invoke(
+            String(prompt[dss_prefixIndex...]),
+            dss_arguments: defaultText
+        )
     }
     
     @available(iOS 15.0, *)

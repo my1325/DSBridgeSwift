@@ -8,6 +8,7 @@
 import Foundation
 
 public typealias DSS_HandlerMethod = @Sendable ([String: Any]?) async -> Sendable?
+
 public protocol DSS_NamespaceHandler {
     var dss_namespace: String { get }
     
